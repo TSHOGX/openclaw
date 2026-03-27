@@ -80,6 +80,10 @@ export class MemorySyncError extends Error {
   }
 }
 
+const isPromiseLike = (value: unknown): value is PromiseLike<unknown> =>
+  ((typeof value === "object" && value !== null) || typeof value === "function") &&
+  typeof (value as { then?: unknown }).then === "function";
+
 type MemoryFileSyncResult = {
   syncedPaths: Set<string>;
   deletedPaths: Set<string>;
@@ -344,6 +348,9 @@ export abstract class MemoryManagerSyncOps {
     this.db.exec(`SAVEPOINT ${savepointName}`);
     try {
       const result = action();
+      if (isPromiseLike(result)) {
+        throw new Error("withIndexWriteSavepoint only supports synchronous actions");
+      }
       this.db.exec(`RELEASE SAVEPOINT ${savepointName}`);
       return result;
     } catch (err) {
@@ -956,6 +963,13 @@ export abstract class MemoryManagerSyncOps {
       this.sessionsDirty = true;
     }
     if (params.sessionResult) {
+      if (params.sessionResult.fatalProviderError) {
+        // A provider interruption can stop scheduling mid-reindex, so the partial
+        // synced/failed sets are not a trustworthy coverage list for the next retry.
+        this.sessionsDirtyFiles.clear();
+        this.sessionsDirty = true;
+        return;
+      }
       this.markSessionFilesDirty(params.sessionResult.syncedFiles);
       this.markSessionFilesDirty(params.sessionResult.failedFiles);
     }
