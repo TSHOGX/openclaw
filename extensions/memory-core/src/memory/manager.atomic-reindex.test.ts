@@ -67,7 +67,7 @@ describe("memory manager atomic reindex", () => {
     await fs.rm(fixtureRoot, { recursive: true, force: true });
   });
 
-  const createCfg = (params?: { sources?: TestMemorySource[] }) =>
+  const createCfg = (params?: { sources?: TestMemorySource[]; cacheEnabled?: boolean }) =>
     ({
       agents: {
         defaults: {
@@ -76,7 +76,7 @@ describe("memory manager atomic reindex", () => {
             provider: "openai",
             model: "mock-embed",
             store: { path: indexPath },
-            cache: { enabled: false },
+            cache: { enabled: params?.cacheEnabled ?? false },
             // Perf: keep test indexes to a single chunk to reduce sqlite work.
             chunking: { tokens: 4000, overlap: 0 },
             sync: { watch: false, onSessionStart: false, onSearch: false },
@@ -92,7 +92,10 @@ describe("memory manager atomic reindex", () => {
       },
     }) as OpenClawConfig;
 
-  const createManager = async (params?: { sources?: TestMemorySource[] }) => {
+  const createManager = async (params?: {
+    sources?: TestMemorySource[];
+    cacheEnabled?: boolean;
+  }) => {
     manager = await getRequiredMemoryIndexManager({
       cfg: createCfg(params),
       agentId: "main",
@@ -122,6 +125,55 @@ describe("memory manager atomic reindex", () => {
 
     const afterStatus = manager.status();
     expect(afterStatus.chunks).toBeGreaterThan(0);
+  });
+
+  it("preserves successful batch cache writes across atomic reindex rollback", async () => {
+    manager = await createManager({ cacheEnabled: true });
+    const line = "a".repeat(4200);
+    await fs.writeFile(path.join(workspaceDir, "MEMORY.md"), `${line}\n${line}`);
+
+    let calls = 0;
+    embedBatch.mockImplementation(async (texts: string[]) => {
+      calls += 1;
+      if (calls === 2) {
+        throw new Error("embedding failure");
+      }
+      return texts.map((_, index) => [index + 1, 0, 0]);
+    });
+
+    await expect(manager.sync({ force: true })).rejects.toThrow("embedding failure");
+    expect(calls).toBe(2);
+
+    embedBatch.mockImplementation(async (texts: string[]) => {
+      calls += 1;
+      return texts.map((_, index) => [index + 1, 0, 0]);
+    });
+
+    await manager.sync({ force: true });
+    expect(calls).toBe(3);
+  });
+
+  it("allows enabling cache on an existing index created without the cache table", async () => {
+    manager = await createManager({ cacheEnabled: false });
+    await manager.sync({ force: true });
+    await manager.close();
+    manager = null;
+
+    manager = await createManager({ cacheEnabled: true });
+    await expect(manager.sync({ force: true })).resolves.toBeUndefined();
+
+    const cacheTable = (
+      manager as unknown as {
+        db: {
+          prepare: (sql: string) => {
+            get: (tableName: string) => { name: string } | undefined;
+          };
+        };
+      }
+    ).db
+      .prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?`)
+      .get("embedding_cache");
+    expect(cacheTable?.name).toBe("embedding_cache");
   });
 
   it("retries rolled-back memory work after a session-triggered full reindex failure", async () => {
@@ -211,6 +263,7 @@ describe("memory manager atomic reindex", () => {
 
       const internal = manager as unknown as {
         sessionsDirty: boolean;
+        sessionFullRetryPending: boolean;
         sessionsDirtyFiles: Set<string>;
         db: {
           prepare: (sql: string) => {
@@ -260,16 +313,35 @@ describe("memory manager atomic reindex", () => {
         expect(getSessionHash(sessionRelPath)).toBe(originalHashes.get(sessionRelPath));
       }
       expect(internal.sessionsDirty).toBe(true);
+      expect(internal.sessionFullRetryPending).toBe(true);
       expect(internal.sessionsDirtyFiles.size).toBe(0);
 
       internal.indexFile = originalIndexFile;
       internal.getIndexConcurrency = originalGetIndexConcurrency;
+      await manager.sync({
+        reason: "post-compaction",
+        sessionFiles: [firstSessionPath],
+      });
+
+      expect(getSessionHash("sessions/001-first.jsonl")).not.toBe(
+        originalHashes.get(sessionRelPaths[0]),
+      );
+      expect(getSessionHash("sessions/002-second.jsonl")).toBe(
+        originalHashes.get(sessionRelPaths[1]),
+      );
+      expect(getSessionHash("sessions/003-third.jsonl")).toBe(
+        originalHashes.get(sessionRelPaths[2]),
+      );
+      expect(internal.sessionsDirty).toBe(true);
+      expect(internal.sessionFullRetryPending).toBe(true);
+
       await manager.sync({ reason: "retry" });
 
       for (const sessionRelPath of sessionRelPaths) {
         expect(getSessionHash(sessionRelPath)).not.toBe(originalHashes.get(sessionRelPath));
       }
       expect(internal.sessionsDirty).toBe(false);
+      expect(internal.sessionFullRetryPending).toBe(false);
       expect(internal.sessionsDirtyFiles.size).toBe(0);
     } finally {
       if (previousStateDir === undefined) {

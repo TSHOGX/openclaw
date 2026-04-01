@@ -117,6 +117,7 @@ export abstract class MemoryManagerSyncOps {
   protected provider: EmbeddingProvider | null = null;
   protected fallbackFrom?: EmbeddingProviderId;
   protected providerRuntime?: EmbeddingProviderRuntime;
+  protected embeddingCacheMirrorDb: DatabaseSync | null = null;
   protected abstract batch: {
     enabled: boolean;
     wait: boolean;
@@ -148,6 +149,7 @@ export abstract class MemoryManagerSyncOps {
   protected closed = false;
   protected dirty = false;
   protected sessionsDirty = false;
+  protected sessionFullRetryPending = false;
   protected sessionsDirtyFiles = new Set<string>();
   protected sessionPendingFiles = new Set<string>();
   protected sessionDeltas = new Map<
@@ -279,6 +281,12 @@ export abstract class MemoryManagerSyncOps {
       return;
     }
     try {
+      const cacheTable = sourceDb
+        .prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?`)
+        .get(EMBEDDING_CACHE_TABLE) as { name: string } | undefined;
+      if (!cacheTable) {
+        return;
+      }
       const rows = sourceDb
         .prepare(
           `SELECT provider, model, provider_key, hash, embedding, dims, updated_at FROM ${EMBEDDING_CACHE_TABLE}`,
@@ -640,12 +648,13 @@ export abstract class MemoryManagerSyncOps {
         this.sessionsDirtyFiles.delete(targetSessionFile);
       }
     }
-    this.sessionsDirty = this.sessionsDirtyFiles.size > 0;
+    this.sessionsDirty = this.sessionFullRetryPending || this.sessionsDirtyFiles.size > 0;
   }
 
   private snapshotSyncState(): {
     dirty: boolean;
     sessionsDirty: boolean;
+    sessionFullRetryPending: boolean;
     sessionsDirtyFiles: Set<string>;
     sessionDeltas: Map<string, { lastSize: number; pendingBytes: number; pendingMessages: number }>;
     lastMetaSerialized: string | null;
@@ -654,6 +663,7 @@ export abstract class MemoryManagerSyncOps {
     return {
       dirty: this.dirty,
       sessionsDirty: this.sessionsDirty,
+      sessionFullRetryPending: this.sessionFullRetryPending,
       sessionsDirtyFiles: new Set(this.sessionsDirtyFiles),
       sessionDeltas: new Map(
         Array.from(this.sessionDeltas, ([sessionFile, state]) => [sessionFile, { ...state }]),
@@ -697,8 +707,13 @@ export abstract class MemoryManagerSyncOps {
       mergedDirtyFiles.add(sessionFile);
     }
     this.sessionsDirtyFiles = mergedDirtyFiles;
+    this.sessionFullRetryPending =
+      snapshot.sessionFullRetryPending || liveState?.sessionFullRetryPending === true;
     this.sessionsDirty =
-      snapshot.sessionsDirty || liveState?.sessionsDirty === true || mergedDirtyFiles.size > 0;
+      snapshot.sessionsDirty ||
+      liveState?.sessionsDirty === true ||
+      this.sessionFullRetryPending ||
+      mergedDirtyFiles.size > 0;
     this.sessionDeltas = liveState
       ? this.mergeSessionDeltas(snapshot.sessionDeltas, liveState.sessionDeltas)
       : new Map(
@@ -718,6 +733,7 @@ export abstract class MemoryManagerSyncOps {
     if (params.sessionReindexStarted) {
       // A failed full session rebuild can stop dispatching mid-stream. Clearing
       // the per-file filter forces the next retry to sweep the full session set.
+      this.sessionFullRetryPending = true;
       this.sessionsDirty = true;
       this.sessionsDirtyFiles.clear();
     }
@@ -911,7 +927,10 @@ export abstract class MemoryManagerSyncOps {
     const existingHashes =
       existingRows === null ? null : new Map(existingRows.map((row) => [row.path, row.hash]));
     const indexAll =
-      params.needsFullReindex || Boolean(targetSessionFiles) || this.sessionsDirtyFiles.size === 0;
+      params.needsFullReindex ||
+      this.sessionFullRetryPending ||
+      Boolean(targetSessionFiles) ||
+      this.sessionsDirtyFiles.size === 0;
     log.debug("memory sync: indexing session files", {
       files: files.length,
       indexAll,
@@ -1144,9 +1163,12 @@ export abstract class MemoryManagerSyncOps {
           targetSessionFiles: targetSessionFiles ? Array.from(targetSessionFiles) : undefined,
           progress: progress ?? undefined,
         });
+        this.sessionFullRetryPending = false;
         this.sessionsDirty = false;
         this.sessionsDirtyFiles.clear();
       } else if (this.sessionsDirtyFiles.size > 0) {
+        this.sessionsDirty = true;
+      } else if (this.sessionFullRetryPending) {
         this.sessionsDirty = true;
       } else {
         this.sessionsDirty = false;
@@ -1272,6 +1294,10 @@ export abstract class MemoryManagerSyncOps {
 
     try {
       this.seedEmbeddingCache(originalDb);
+      const cacheTable = originalDb
+        .prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?`)
+        .get(EMBEDDING_CACHE_TABLE) as { name: string } | undefined;
+      this.embeddingCacheMirrorDb = cacheTable ? originalDb : null;
       const shouldSyncMemory = this.sources.has("memory");
       const shouldSyncSessions = this.shouldSyncSessions(
         { reason: params.reason, force: params.force },
@@ -1287,9 +1313,12 @@ export abstract class MemoryManagerSyncOps {
       if (shouldSyncSessions) {
         sessionReindexStarted = true;
         await this.syncSessionFiles({ needsFullReindex: true, progress: params.progress });
+        this.sessionFullRetryPending = false;
         this.sessionsDirty = false;
         this.sessionsDirtyFiles.clear();
       } else if (this.sessionsDirtyFiles.size > 0) {
+        this.sessionsDirty = true;
+      } else if (this.sessionFullRetryPending) {
         this.sessionsDirty = true;
       } else {
         this.sessionsDirty = false;
@@ -1315,6 +1344,7 @@ export abstract class MemoryManagerSyncOps {
 
       this.writeMeta(nextMeta);
       this.pruneEmbeddingCacheIfNeeded?.();
+      this.embeddingCacheMirrorDb = null;
 
       this.db.close();
       originalDb.close();
@@ -1329,6 +1359,7 @@ export abstract class MemoryManagerSyncOps {
       this.ensureSchema();
       this.vector.dims = nextMeta?.vectorDims;
     } catch (err) {
+      this.embeddingCacheMirrorDb = null;
       const liveSyncState = this.snapshotSyncState();
       try {
         this.db.close();
@@ -1372,9 +1403,12 @@ export abstract class MemoryManagerSyncOps {
       if (shouldSyncSessions) {
         sessionReindexStarted = true;
         await this.syncSessionFiles({ needsFullReindex: true, progress: params.progress });
+        this.sessionFullRetryPending = false;
         this.sessionsDirty = false;
         this.sessionsDirtyFiles.clear();
       } else if (this.sessionsDirtyFiles.size > 0) {
+        this.sessionsDirty = true;
+      } else if (this.sessionFullRetryPending) {
         this.sessionsDirty = true;
       } else {
         this.sessionsDirty = false;

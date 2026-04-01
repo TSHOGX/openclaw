@@ -1,4 +1,5 @@
 import fs from "node:fs/promises";
+import type { DatabaseSync } from "node:sqlite";
 import {
   enforceEmbeddingMaxInputTokens,
   estimateStructuredEmbeddingInputBytes,
@@ -117,7 +118,10 @@ export abstract class MemoryManagerEmbeddingOps extends MemoryManagerSyncOps {
     return out;
   }
 
-  private upsertEmbeddingCache(entries: Array<{ hash: string; embedding: number[] }>): void {
+  private upsertEmbeddingCacheInto(
+    db: DatabaseSync,
+    entries: Array<{ hash: string; embedding: number[] }>,
+  ): void {
     if (!this.cache.enabled || !this.provider) {
       return;
     }
@@ -125,7 +129,7 @@ export abstract class MemoryManagerEmbeddingOps extends MemoryManagerSyncOps {
       return;
     }
     const now = Date.now();
-    const stmt = this.db.prepare(
+    const stmt = db.prepare(
       `INSERT INTO ${EMBEDDING_CACHE_TABLE} (provider, model, provider_key, hash, embedding, dims, updated_at)\n` +
         ` VALUES (?, ?, ?, ?, ?, ?, ?)\n` +
         ` ON CONFLICT(provider, model, provider_key, hash) DO UPDATE SET\n` +
@@ -144,6 +148,13 @@ export abstract class MemoryManagerEmbeddingOps extends MemoryManagerSyncOps {
         embedding.length,
         now,
       );
+    }
+  }
+
+  private upsertEmbeddingCache(entries: Array<{ hash: string; embedding: number[] }>): void {
+    this.upsertEmbeddingCacheInto(this.db, entries);
+    if (this.embeddingCacheMirrorDb && this.embeddingCacheMirrorDb !== this.db) {
+      this.upsertEmbeddingCacheInto(this.embeddingCacheMirrorDb, entries);
     }
   }
 
