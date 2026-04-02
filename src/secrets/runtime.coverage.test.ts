@@ -106,8 +106,21 @@ function toConcretePathSegments(pathPattern: string): string[] {
   return out;
 }
 
+function resolveCoverageEnvId(entry: SecretRegistryEntry, fallbackEnvId: string): string {
+  return entry.id === "plugins.entries.firecrawl.config.webFetch.apiKey"
+    ? "FIRECRAWL_API_KEY"
+    : fallbackEnvId;
+}
+
+function resolveCoverageResolvedPath(entry: SecretRegistryEntry): string {
+  return entry.id === "tools.web.x_search.apiKey"
+    ? "plugins.entries.xai.config.webSearch.apiKey"
+    : entry.pathPattern;
+}
+
 function buildConfigForOpenClawTarget(entry: SecretRegistryEntry, envId: string): OpenClawConfig {
   const config = {} as OpenClawConfig;
+  const resolvedEnvId = resolveCoverageEnvId(entry, envId);
   const refTargetPath =
     entry.secretShape === "sibling_ref" && entry.refPathPattern // pragma: allowlist secret
       ? entry.refPathPattern
@@ -115,7 +128,7 @@ function buildConfigForOpenClawTarget(entry: SecretRegistryEntry, envId: string)
   setPathCreateStrict(config, toConcretePathSegments(refTargetPath), {
     source: "env",
     provider: "default",
-    id: envId,
+    id: resolvedEnvId,
   });
   if (entry.id === "gateway.auth.password") {
     setPathCreateStrict(config, ["gateway", "auth", "mode"], "password");
@@ -191,9 +204,6 @@ function buildConfigForOpenClawTarget(entry: SecretRegistryEntry, envId: string)
   if (entry.id === "plugins.entries.tavily.config.webSearch.apiKey") {
     setPathCreateStrict(config, ["tools", "web", "search", "provider"], "tavily");
   }
-  if (entry.id === "tools.web.x_search.apiKey") {
-    setPathCreateStrict(config, ["tools", "web", "x_search", "enabled"], true);
-  }
   return config;
 }
 
@@ -250,14 +260,18 @@ describe("secrets runtime target coverage", () => {
     );
     for (const [index, entry] of entries.entries()) {
       const envId = `OPENCLAW_SECRET_TARGET_${index}`;
+      const runtimeEnvId = resolveCoverageEnvId(entry, envId);
       const expectedValue = `resolved-${entry.id}`;
       const snapshot = await prepareSecretsRuntimeSnapshot({
         config: buildConfigForOpenClawTarget(entry, envId),
-        env: { [envId]: expectedValue },
+        env: { [runtimeEnvId]: expectedValue },
         agentDirs: ["/tmp/openclaw-agent-main"],
         loadAuthStore: () => ({ version: 1, profiles: {} }),
       });
-      const resolved = getPath(snapshot.config, toConcretePathSegments(entry.pathPattern));
+      const resolved = getPath(
+        snapshot.config,
+        toConcretePathSegments(resolveCoverageResolvedPath(entry)),
+      );
       if (entry.expectedResolvedValue === "string") {
         expect(resolved).toBe(expectedValue);
       } else {
